@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schema name="external-refs" version="1.6">
+
+    <!-- Synthetic unique key: pid!ds -->
+    <field name="id"
+        type="string"
+        indexed="true"
+        stored="true"
+        required="true"
+        multiValued="false" />
+
+    <uniqueKey>id</uniqueKey>
+
+    <!-- Kramerius PID -->
+    <field name="pid"
+        type="string"
+        indexed="true"
+        stored="true"
+        multiValued="false" />
+
+    <!-- Datastream (IMG_FULL, IMG_PREVIEW, ALTO, PDF, etc.) -->
+    <field name="ds"
+        type="string"
+        indexed="true"
+        stored="true"
+        multiValued="false" />
+
+    <!-- Resource URI (JP2 path, PDF path, etc.) -->
+    <field name="uri"
+        type="string"
+        indexed="true"
+        stored="true"
+        multiValued="false" />
+
+    <!-- Optional: ingestion/update timestamp -->
+    <field name="timestamp"
+        type="tdate"
+        indexed="true"
+        stored="true"
+        default="NOW" />
+
+    <!-- Solr internal versioning field -->
+    <field name="_version_"
+        type="long"
+        indexed="true"
+        stored="true" />
+
+    <!-- Types -->
+    <fieldType name="string"
+        class="solr.StrField"
+        sortMissingLast="true" />
+
+    <fieldType name="tdate"
+        class="solr.TrieDateField"
+        precisionStep="0"
+        positionIncrementGap="0" />
+
+    <fieldType name="long"
+        class="solr.TrieLongField"
+        positionIncrementGap="0"
+        docValues="true"
+        precisionStep="0" />
+
+</schema>
