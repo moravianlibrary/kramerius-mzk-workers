@@ -1,0 +1,12 @@
+pluginManagement {
+    repositories {
+        maven {
+            url = uri("https://raw.githubusercontent.com/ceskaexpedice/process-platform/main/process-plugin-gradle/docs")
+        }
+        gradlePluginPortal()
+    }
+}
+
+rootProject.name = 'kramerius-mzk-workers'
+
+include 'plugins:external-refs'

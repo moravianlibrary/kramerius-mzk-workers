@@ -1,0 +1,5 @@
+*
+!settings.gradle
+!build.gradle
+!plugins
+plugins/*/build

@@ -1,0 +1,13 @@
+plugins {
+    id 'java-library'
+    id 'org.ceskaexpedice.processplatform.process' version '1.0.6'
+}
+
+description "External refs harvest"
+
+processPlugin {
+    spiImplementation='cz.mzk.kramerius.plugin.ExternalRefsSPI'
+    profiles = [
+            [profileId: "external-refs",description: "Harvest external datastream refs from object store",jvmArgs: ["-Xms1g","-Xmx4g"]]
+    ]
+}

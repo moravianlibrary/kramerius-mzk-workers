@@ -1,0 +1,31 @@
+// Plugins run inside the worker with the worker's libraries as their parent classloader,
+// so they compile against the libraries of the base image and bundle none of them.
+def baseLibs = files('/base/WEB-INF/classes') + fileTree(dir: '/base/WEB-INF/lib', include: '*.jar')
+
+subprojects {
+    group = 'cz.mzk.kramerius'
+    version = '1.0.0'
+
+    repositories {
+        mavenCentral()
+    }
+
+    pluginManager.withPlugin('java') {
+        java {
+            sourceCompatibility = JavaVersion.VERSION_21
+            targetCompatibility = JavaVersion.VERSION_21
+        }
+
+        dependencies {
+            compileOnly baseLibs
+            testImplementation baseLibs
+            testImplementation platform('org.junit:junit-bom:5.10.2')
+            testImplementation 'org.junit.jupiter:junit-jupiter'
+            testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+        }
+
+        test {
+            useJUnitPlatform()
+        }
+    }
+}

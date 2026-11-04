@@ -1,0 +1,9 @@
+<processes>
+    <process>
+        <id>external-refs</id>
+        <description>External refs harvest</description>
+        <mainClass>cz.mzk.kramerius.plugin.ExternalRefsStarter</mainClass>
+        <javaProcessParameters>-Xmx4g -Xms1g -Dfile.encoding=UTF-8</javaProcessParameters>
+        <securedaction>a_rebuild_processing_index</securedaction>
+    </process>
+</processes>
