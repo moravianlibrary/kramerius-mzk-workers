@@ -153,4 +153,12 @@ spec:
 
 #### Results
 
+As a side effect, a run finds corrupted FOXML files. A file counts as corrupted if it cannot be parsed as XML, or if an external datastream in it has no `ID`. Each one is logged with its PID, path and error, and the count is in the `Harvest finished` line:
+
+```
+WARNING: Skipping corrupted object uuid:... (/data/akubra/objectStore/...): org.xml.sax.SAXParseException...
+```
+
+To list them, search the process logs for `Skipping corrupted object`. To check every file, read the whole store with a first or `full` run, or with split runs covering all of it, because incremental runs read only changed files. A run does not check whether the content of a valid FOXML file is correct.
+
 After a successful scan of the whole store (the first run, or `full`), refs the scan did not see get `orphaned=true`, except refs of corrupted objects and ignored datastreams, which it did not check. A ref that comes back resets to `false`. Incremental runs do not flag anything, because they do not read unchanged files. Split runs and `since` runs do not flag anything either, so run `full` without `paths` to flag refs in an existing collection.
