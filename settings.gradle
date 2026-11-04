@@ -10,3 +10,4 @@ pluginManagement {
 rootProject.name = 'kramerius-mzk-workers'
 
 include 'plugins:external-refs'
+include 'plugins:ndk-import'

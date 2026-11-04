@@ -162,3 +162,77 @@ WARNING: Skipping corrupted object uuid:... (/data/akubra/objectStore/...): org.
 To list them, search the process logs for `Skipping corrupted object`. To check every file, read the whole store with a first or `full` run, or with split runs covering all of it, because incremental runs read only changed files. A run does not check whether the content of a valid FOXML file is correct.
 
 After a successful scan of the whole store (the first run, or `full`), refs the scan did not see get `orphaned=true`, except refs of corrupted objects and ignored datastreams, which it did not check. A ref that comes back resets to `false`. Incremental runs do not flag anything, because they do not read unchanged files. Split runs and `since` runs do not flag anything either, so run `full` without `paths` to flag refs in an existing collection.
+
+### ndk-import
+
+Imports a batch of FOXML like the stock `import` process, but first moves the `ALTO` and `TEXT_OCR` content that the FOXML only references as files into the FOXML itself. Akubra then stores that content in its datastream store at ingest, so no imported object keeps a `file:` reference into the import directory, and the batch can be deleted as soon as the process finishes.
+
+NDK batches reference these streams as managed datastreams with a `file:` location:
+
+```xml
+<datastream ID="ALTO" CONTROL_GROUP="M" STATE="A" VERSIONABLE="false">
+  <datastreamVersion ID="ALTO.0" CREATED="..." MIMETYPE="text/plain">
+    <contentLocation TYPE="URL" REF="file:/kramerius_ndk/import/<batch>/alto_<batch>_0001.xml.alto"/>
+  </datastreamVersion>
+</datastream>
+```
+
+The stock import stores such a datastream as a reference, so the object breaks once the batch is removed.
+
+#### Setup
+
+Worker `configuration.properties`:
+
+```properties
+# relative inputDataDir with pathRoot=ndk resolves under this directory
+ndk.import.root=/data/import/ndk
+# rewritten copies go to <workDir>/<process uuid>/; must not be inside ndk.import.root
+ndk.import.workDir=/data/import/ndk-work
+```
+
+The worker needs the import volumes mounted read-write, including `workDir`. Users without `a_process_edit` can only start the process if `plugins/ndk-import/lp.xml` is mounted as `~/.kramerius4/lp.xml` on the Kramerius API pods. The process needs `a_import`.
+
+#### Configuration
+
+| Key | Default | Meaning |
+|---|---|---|
+| `ndk.import.root` | required | Base directory for relative paths with `pathRoot=ndk` |
+| `ndk.import.workDir` | required | Where rewritten copies are written, one directory per process |
+| `ndk.import.pathMap` | none | `;`-separated `from=>to` prefixes applied to absolute paths and to file references, for batches that name an older mount point, such as `/kramerius_ndk/import/=>/data/import/ndk/` |
+| `ndk.import.internalize` | `ALTO,TEXT_OCR` | Datastream IDs whose file references are moved into the FOXML |
+| `ndk.import.keepWorkDirOnFailure` | `true` | Keep the rewritten copy when the import or the verification fails |
+| `ndk.import.lockStaleHours` | `24` | Age after which another run may take over a batch lock |
+| `import.directory` | stock | Base for relative paths without `pathRoot` |
+
+Every path, after `pathMap`, must lie under `ndk.import.root` or `import.directory`, including file references and through symlinks.
+
+#### Parameters
+
+Start it with `POST /search/api/admin/v7.0/processes`:
+
+```json
+{"defid": "ndk_import", "params": {"inputDataDir": "<batch uuid>", "startIndexer": "true", "pathRoot": "ndk"}}
+```
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `inputDataDir` | required | Batch directory, relative or absolute |
+| `startIndexer` | required | As in the stock `import` |
+| `license`, `collections` | none | As in the stock `import` |
+| `indexationType` | `ingest.indexType` | As in the stock `import` |
+| `pathtype` | `relative` | `relative` or `absolute` |
+| `pathRoot` | `import.directory` | `ndk` resolves relative paths under `ndk.import.root` |
+| `externalStreams` | `internalize` | `internalize`; `keep` imports the batch as the stock `import` would; `check` only verifies already imported objects |
+| `dryRun` | `false` | Resolve, lock and check the batch, ingest nothing |
+
+#### How a run works
+
+1. **Resolve** `inputDataDir` and refuse anything outside the configured roots.
+2. **Lock** the batch with `<batch>/.ndk-import.lock`, so a second run of the same batch fails straight away.
+3. **Check** every FOXML: list the `ALTO`/`TEXT_OCR` file references and fail before ingesting anything if any file is missing or outside the roots. File references in other datastreams are logged as warnings and left alone.
+4. **Rewrite** the FOXML into `<workDir>/<process uuid>/`, with each listed reference replaced by its content as base64 `binaryContent`. Everything else in the FOXML stays as it was; objects without such references are copied as they are.
+5. **Import** the rewritten copy with the stock `Import`.
+6. **Verify** that each of those datastreams is now stored as managed content and no longer points into an import root.
+7. **Clean up** the rewritten copy and remove the lock. The batch itself is never changed.
+
+After a failed import or verification, the rewritten copy stays in `workDir` (with `keepWorkDirOnFailure=true`), and the batch can be run again: objects that already exist are handled as the stock import handles them.

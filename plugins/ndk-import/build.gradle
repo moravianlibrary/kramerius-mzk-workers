@@ -1,0 +1,17 @@
+plugins {
+    id 'java-library'
+    id 'org.ceskaexpedice.processplatform.process' version '1.0.6'
+}
+
+description "NDK FOXML import with ALTO/TEXT_OCR stored in Akubra"
+
+processPlugin {
+    spiImplementation='cz.mzk.kramerius.plugin.ndkimport.NdkImportSPI'
+    profiles = [
+            [profileId: "ndk_import",description: "NDK FOXML import with ALTO/TEXT_OCR stored in Akubra",jvmArgs: ["-Xms1g","-Xmx3g"]]
+    ]
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.compilerArgs += ['-Xlint:all', '-Werror']
+}

@@ -1,0 +1,9 @@
+<processes>
+    <process>
+        <id>ndk_import</id>
+        <description>NDK import (ALTO/TEXT_OCR stored in Akubra)</description>
+        <mainClass>cz.mzk.kramerius.plugin.ndkimport.NdkImportStarter</mainClass>
+        <javaProcessParameters>-Xmx3g -Xms1g -Dfile.encoding=UTF-8</javaProcessParameters>
+        <securedaction>a_import</securedaction>
+    </process>
+</processes>
