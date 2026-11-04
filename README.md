@@ -38,7 +38,7 @@ Users without `a_process_edit` can only start the process if `plugins/external-r
 Start it with `POST /search/api/admin/v7.0/processes`:
 
 ```json
-{"defid": "external-refs", "params": {"threads": "4"}}
+{"defid": "external-refs", "params": {"threads": "6"}}
 ```
 
 All parameters are optional, and with none of them the run reads what changed since the last successful run. The first run has nothing to compare with, so it reads everything.
@@ -84,7 +84,7 @@ A run with `paths` does not save the last successful run and does not flag orpha
    for part in 0 1 2 3 4 5 6 7 8 9 a b c d e f; do
      curl -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
        "$KRAMERIUS/search/api/admin/v7.0/processes" \
-       -d '{"defid": "external-refs", "params": {"paths": "'"$part"'", "threads": "24"}}'
+       -d '{"defid": "external-refs", "params": {"paths": "'"$part"'", "threads": "6"}}'
    done
    ```
 
@@ -96,6 +96,60 @@ A run with `paths` does not save the last successful run and does not flag orpha
    ```
 
 After that, normal runs without parameters read only what changed.
+
+#### Periodic refresh
+
+The plugin has no schedule of its own. To keep the collection current, start a run without parameters periodically. This Kubernetes CronJob is an example to adapt, it has not been run as written:
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: external-refs-refresh
+spec:
+  schedule: "0 1 * * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: refresh
+              image: <image with bash, curl and jq>
+              envFrom:
+                # KRAMERIUS, KEYCLOAK, CLIENT_ID, CLIENT_SECRET
+                - secretRef:
+                    name: external-refs-refresh
+              command:
+                - bash
+                - -c
+                - |
+                  set -euo pipefail
+                  token=$(curl -sf "$KEYCLOAK/realms/kramerius/protocol/openid-connect/token" \
+                    -d grant_type=client_credentials -d "client_id=$CLIENT_ID" -d "client_secret=$CLIENT_SECRET" \
+                    | jq -r .access_token)
+                  api="$KRAMERIUS/search/api/admin/v7.0/processes"
+
+                  for state in PLANNED RUNNING; do
+                    active=$(curl -sf -H "Authorization: Bearer $token" "$api/batches?state=$state&limit=100" \
+                      | jq '[.batches[].processes[] | select(.defid == "external-refs")] | length')
+                    if [ "$active" -gt 0 ]; then
+                      echo "A harvest is already $state, skipping"
+                      exit 0
+                    fi
+                  done
+
+                  curl -sf -H "Authorization: Bearer $token" -H "Content-Type: application/json" "$api" \
+                    -d '{"defid": "external-refs", "params": {"threads": "6"}}'
+```
+
+- **Start after the first full build:** until a whole store run has saved the last successful run, a run without parameters reads everything.
+- **Overlapping runs:** `concurrencyPolicy` only covers the job that submits the process, not the process itself, so the script asks the API whether a harvest is active.
+- **Frequency:** every run walks the whole store to compare modification times, even when little changed. Check how long a run takes before choosing a schedule.
+- **Failures:** a failed run does not save the last successful run, so the next run picks up its changes.
+- **Removed refs:** these runs do not flag anything, so refs of deleted objects and removed datastreams stay as they are. To flag them, schedule an occasional `full` run without `paths`, which reads the whole store on one worker.
 
 #### Results
 
