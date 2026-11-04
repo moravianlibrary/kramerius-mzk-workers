@@ -27,7 +27,7 @@ externalRefs.solrHost=http://<solr>:8983/solr/external-refs
 objectStore.path=/data/akubra/objectStore
 ```
 
-The worker needs the object store mounted. The collection is created from the configset in `solr/external-refs`.
+The worker needs the object store mounted. The collection is created from the configset in `solr/external-refs`, which must match the schema in the deployments repository.
 
 Users without `a_process_edit` can only start the process if `plugins/external-refs/lp.xml` is mounted as `~/.kramerius4/lp.xml` on the Kramerius API pods.
 
@@ -45,4 +45,8 @@ Start it with `POST /search/api/admin/v7.0/processes`:
 
 The last successful run is stored in the `__harvest_state__` document, so exclude it from queries with `-id:__harvest_state__`.
 
-Corrupted FOXML files are logged as warnings and skipped, and are read again once the file changes. The run still completes and the process ends as `WARNING`, with the count in the process log. Storage read errors and Solr errors fail the run, and the next run repeats the same scan.
+Corrupted FOXML files are logged as warnings and skipped, and are read again once the file changes. The run still completes and the process ends as `WARNING`, with the count in the process log. Storage read errors fail the run, and the next run repeats the same scan.
+
+Solr timeouts, connection errors and 5xx responses are retried for about 30 minutes, and the scan slows down while it waits. If Solr stays away, or rejects a request with a 4xx, the run fails and the next run repeats the same scan.
+
+After a successful scan of the whole store (the first run, or `full`), refs the scan did not see get `orphaned=true`, except refs of corrupted objects and ignored datastreams, which it did not check. A ref that comes back resets to `false`. Incremental runs do not flag anything, because they do not read unchanged files.

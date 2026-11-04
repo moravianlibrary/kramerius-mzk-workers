@@ -3,9 +3,11 @@ package cz.mzk.kramerius.plugin;
 import org.apache.solr.client.solrj.SolrClient;
 import org.apache.solr.client.solrj.SolrRequest;
 import org.apache.solr.client.solrj.SolrServerException;
+import org.apache.solr.client.solrj.request.QueryRequest;
 import org.apache.solr.client.solrj.request.UpdateRequest;
 import org.apache.solr.common.SolrDocument;
 import org.apache.solr.common.SolrDocumentList;
+import org.apache.solr.common.SolrException;
 import org.apache.solr.common.SolrInputDocument;
 import org.apache.solr.common.util.NamedList;
 import org.junit.jupiter.api.Test;
@@ -22,7 +24,9 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Date;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -65,7 +69,7 @@ class ExternalRefsHarvesterTest {
     private final FakeSolrClient solr = new FakeSolrClient();
 
     private ExternalRefsHarvester harvester() {
-        return new ExternalRefsHarvester(solr, "external-refs", Set.of("POLICY"));
+        return new ExternalRefsHarvester(solr, "external-refs", Set.of("POLICY"), List.of(Duration.ZERO, Duration.ZERO));
     }
 
     private Path object(String uuid, String content) throws IOException {
@@ -166,6 +170,66 @@ class ExternalRefsHarvesterTest {
     }
 
     @Test
+    void fullScanFlagsUnseenRefsAsOrphaned() throws Exception {
+        object("live", FOXML);
+        solr.staleRefs.add(staleRef("uuid:gone", "IMG_FULL"));
+
+        harvester().harvest(store, 2, false);
+
+        assertEquals(List.of("uuid:gone!IMG_FULL"), solr.orphaned());
+    }
+
+    @Test
+    void forcedFullScanFlagsUnseenRefsAsOrphaned() throws Exception {
+        solr.existingState = Date.from(Instant.now());
+        solr.staleRefs.add(staleRef("uuid:gone", "IMG_FULL"));
+
+        harvester().harvest(store, 2, true);
+
+        assertEquals(List.of("uuid:gone!IMG_FULL"), solr.orphaned());
+    }
+
+    @Test
+    void incrementalRunFlagsNothing() throws Exception {
+        solr.existingState = Date.from(Instant.now().minus(Duration.ofDays(1)));
+        solr.staleRefs.add(staleRef("uuid:gone", "IMG_FULL"));
+
+        harvester().harvest(store, 2, false);
+
+        assertEquals(List.of(), solr.orphaned());
+    }
+
+    @Test
+    void refsThatWereNotCheckedAreNotFlagged() throws Exception {
+        object("broken", "<not-xml");
+        solr.staleRefs.add(staleRef("uuid:broken", "IMG_FULL"));
+        solr.staleRefs.add(staleRef("uuid:live", "POLICY"));
+
+        harvester().harvest(store, 2, false);
+
+        assertEquals(List.of(), solr.orphaned());
+    }
+
+    @Test
+    void failedScanFlagsNothing() throws Exception {
+        object("a", FOXML);
+        Files.createSymbolicLink(store.resolve("00/11/info%3Afedora%2Fuuid%3Agone"), store.resolve("missing"));
+        solr.staleRefs.add(staleRef("uuid:gone", "IMG_FULL"));
+
+        assertThrows(IOException.class, () -> harvester().harvest(store, 2, false));
+
+        assertEquals(List.of(), solr.orphaned());
+    }
+
+    private static SolrDocument staleRef(String pid, String ds) {
+        SolrDocument doc = new SolrDocument();
+        doc.setField("id", pid + "!" + ds);
+        doc.setField("pid", pid);
+        doc.setField("ds", ds);
+        return doc;
+    }
+
+    @Test
     void solrUpdateFailureFailsTheRunAndKeepsState() throws Exception {
         object("a", FOXML);
         solr.failUpdates = true;
@@ -173,6 +237,51 @@ class ExternalRefsHarvesterTest {
         assertThrows(IOException.class, () -> harvester().harvest(store, 2, false));
 
         assertNull(solr.state());
+    }
+
+    @Test
+    void shortSolrOutageIsRetriedAndRunCompletes() throws Exception {
+        object("a", FOXML);
+        solr.updateFailuresLeft.set(2);
+
+        harvester().harvest(store, 2, false);
+
+        assertEquals(List.of("uuid:a"), solr.pids());
+        assertNotNull(solr.state());
+    }
+
+    @Test
+    void serverErrorIsRetried() throws Exception {
+        object("a", FOXML);
+        solr.updateFailuresLeft.set(1);
+        solr.updateFailure = new SolrException(SolrException.ErrorCode.SERVICE_UNAVAILABLE, "no leader");
+
+        harvester().harvest(store, 2, false);
+
+        assertNotNull(solr.state());
+    }
+
+    @Test
+    void rejectedDocumentsAreNotRetried() throws Exception {
+        object("a", FOXML);
+        solr.updateFailuresLeft.set(1);
+        solr.updateFailure = new SolrException(SolrException.ErrorCode.BAD_REQUEST, "invalid document");
+
+        assertThrows(IOException.class, () -> harvester().harvest(store, 2, false));
+
+        assertEquals(1, solr.updateAttempts.get());
+        assertNull(solr.state());
+    }
+
+    @Test
+    void flaggingIsRetried() throws Exception {
+        object("a", FOXML);
+        solr.staleRefs.add(staleRef("uuid:gone", "IMG_FULL"));
+        solr.queryFailuresAfterFirst.set(1);
+
+        harvester().harvest(store, 2, false);
+
+        assertEquals(List.of("uuid:gone!IMG_FULL"), solr.orphaned());
     }
 
     @Test
@@ -187,17 +296,30 @@ class ExternalRefsHarvesterTest {
 
     private static class FakeSolrClient extends SolrClient {
         final List<SolrInputDocument> documents = Collections.synchronizedList(new ArrayList<>());
+        final List<SolrDocument> staleRefs = new ArrayList<>();
         Date existingState;
         boolean failUpdates;
         boolean failQueries;
         boolean committed;
+        final AtomicInteger updateAttempts = new AtomicInteger();
+        final AtomicInteger updateFailuresLeft = new AtomicInteger();
+        final AtomicInteger queryFailuresAfterFirst = new AtomicInteger();
+        final AtomicInteger queries = new AtomicInteger();
+        RuntimeException updateFailure;
 
         @Override
         public NamedList<Object> request(SolrRequest request, String collection) throws SolrServerException {
             NamedList<Object> response = new NamedList<>();
             if (request instanceof UpdateRequest) {
+                updateAttempts.incrementAndGet();
                 if (failUpdates) {
                     throw new SolrServerException("update failed");
+                }
+                if (updateFailuresLeft.getAndUpdate(left -> Math.max(0, left - 1)) > 0) {
+                    if (updateFailure != null) {
+                        throw updateFailure;
+                    }
+                    throw new SolrServerException("Timeout occurred while waiting response from server");
                 }
                 UpdateRequest update = (UpdateRequest) request;
                 if (update.getDocuments() != null) {
@@ -211,7 +333,19 @@ class ExternalRefsHarvesterTest {
             if (failQueries) {
                 throw new SolrServerException("query failed");
             }
+            if (queries.getAndIncrement() > 0 && queryFailuresAfterFirst.getAndUpdate(left -> Math.max(0, left - 1)) > 0) {
+                throw new SolrServerException("query timed out");
+            }
             SolrDocumentList results = new SolrDocumentList();
+            if ("/select".equals(((QueryRequest) request).getPath()) || request.getPath() == null) {
+                String cursor = request.getParams().get("cursorMark");
+                if ("*".equals(cursor)) {
+                    results.addAll(staleRefs);
+                }
+                response.add("response", results);
+                response.add("nextCursorMark", "done");
+                return response;
+            }
             if (existingState != null) {
                 SolrDocument state = new SolrDocument();
                 state.setField("id", ExternalRefsHarvester.STATE_DOC_ID);
@@ -226,6 +360,13 @@ class ExternalRefsHarvesterTest {
             return documents.stream()
                     .filter(d -> ExternalRefsHarvester.STATE_DOC_ID.equals(d.getFieldValue("id")))
                     .findFirst().orElse(null);
+        }
+
+        List<Object> orphaned() {
+            return documents.stream()
+                    .filter(d -> Map.of("set", true).equals(d.getFieldValue("orphaned")))
+                    .map(d -> d.getFieldValue("id"))
+                    .toList();
         }
 
         List<Object> pids() {

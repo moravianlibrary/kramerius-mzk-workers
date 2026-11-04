@@ -1,9 +1,13 @@
 package cz.mzk.kramerius.plugin;
 
 import org.apache.solr.client.solrj.SolrClient;
+import org.apache.solr.client.solrj.SolrQuery;
 import org.apache.solr.client.solrj.SolrServerException;
+import org.apache.solr.client.solrj.response.QueryResponse;
 import org.apache.solr.common.SolrDocument;
+import org.apache.solr.common.SolrException;
 import org.apache.solr.common.SolrInputDocument;
+import org.apache.solr.common.params.CursorMarkParams;
 import org.w3c.dom.Document;
 import org.w3c.dom.Node;
 import org.w3c.dom.NodeList;
@@ -24,11 +28,14 @@ import java.nio.file.SimpleFileVisitor;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -44,6 +51,13 @@ import java.util.logging.Logger;
  *
  * <p>Corrupted objects are not failures: they are logged and skipped, and read again once their file changes.
  * Failing on them would keep a repository with corrupted objects from ever finishing a run.</p>
+ *
+ * <p>A successful scan of the whole store rewrites every ref it finds, so a ref older than the scan no longer
+ * exists in the store and is flagged as orphaned. A ref that comes back is rewritten, which resets the flag
+ * to its schema default. Incremental runs cannot tell and do not flag anything.</p>
+ *
+ * <p>Solr calls made during a run are retried, because one timeout must not cost a scan that takes days.
+ * Every one of them is idempotent: adds overwrite the same ids, and flagging sets the same value.</p>
  */
 public class ExternalRefsHarvester {
 
@@ -53,23 +67,33 @@ public class ExternalRefsHarvester {
 
     private static final int BATCH_SIZE = 500;
     private static final int MAX_QUEUED_TASKS = 10000;
-    // File mtimes come from the storage clock, the run start from the worker clock
+    // File mtimes come from the storage clock, doc timestamps from the Solr clock, the run start from the worker clock
     private static final Duration SINCE_OVERLAP = Duration.ofHours(1);
+    // About 30 minutes in total, to outlast a Solr restart or a leader election
+    private static final List<Duration> RETRY_DELAYS = List.of(
+            Duration.ofSeconds(10), Duration.ofSeconds(30), Duration.ofMinutes(1), Duration.ofMinutes(2),
+            Duration.ofMinutes(5), Duration.ofMinutes(5), Duration.ofMinutes(5), Duration.ofMinutes(5), Duration.ofMinutes(5));
 
     private final SolrClient solrClient;
     private final String collection;
     private final Set<String> ignoredDatastreams;
+    private final List<Duration> retryDelays;
 
     private final List<SolrInputDocument> batch = new ArrayList<>(BATCH_SIZE);
     private final AtomicLong processed = new AtomicLong();
     private final AtomicLong failed = new AtomicLong();
-    private final AtomicLong corrupted = new AtomicLong();
+    private final Set<String> corruptedPids = ConcurrentHashMap.newKeySet();
     private final AtomicBoolean solrFailed = new AtomicBoolean();
 
     public ExternalRefsHarvester(SolrClient solrClient, String collection, Set<String> ignoredDatastreams) {
+        this(solrClient, collection, ignoredDatastreams, RETRY_DELAYS);
+    }
+
+    ExternalRefsHarvester(SolrClient solrClient, String collection, Set<String> ignoredDatastreams, List<Duration> retryDelays) {
         this.solrClient = solrClient;
         this.collection = collection;
         this.ignoredDatastreams = ignoredDatastreams;
+        this.retryDelays = retryDelays;
     }
 
     /**
@@ -98,10 +122,57 @@ public class ExternalRefsHarvester {
         SolrInputDocument state = new SolrInputDocument();
         state.addField("id", STATE_DOC_ID);
         state.addField("timestamp", Date.from(runStart));
-        solrClient.add(collection, state);
-        solrClient.commit(collection);
-        LOGGER.info("Harvest finished, processed objects: " + processed.get() + ", skipped corrupted objects: " + corrupted.get());
-        return corrupted.get();
+        withRetries("save the harvest state", () -> solrClient.add(collection, state));
+        withRetries("commit", () -> solrClient.commit(collection));
+        LOGGER.info("Harvest finished, processed objects: " + processed.get() + ", skipped corrupted objects: " + corruptedPids.size());
+
+        // After saving the state: failing here must not cost another scan of the whole store
+        if (since.equals(Instant.EPOCH)) {
+            markOrphaned(runStart.minus(SINCE_OVERLAP));
+        }
+        return corruptedPids.size();
+    }
+
+    /**
+     * Refs of corrupted objects and ignored datastreams were not checked by the scan, so they stay unflagged.
+     * Uses atomic updates, so the other fields stay as they are.
+     */
+    private void markOrphaned(Instant cutoff) throws IOException, SolrServerException {
+        SolrQuery query = new SolrQuery("timestamp:[* TO " + cutoff.truncatedTo(ChronoUnit.SECONDS) + "}");
+        query.addFilterQuery("-id:" + STATE_DOC_ID, "-orphaned:true");
+        query.setFields("id", "pid", "ds");
+        query.setRows(BATCH_SIZE);
+        query.setSort("id", SolrQuery.ORDER.asc);
+
+        long marked = 0;
+        String cursor = CursorMarkParams.CURSOR_MARK_START;
+        while (true) {
+            query.set(CursorMarkParams.CURSOR_MARK_PARAM, cursor);
+            QueryResponse response = withRetries("query refs to flag", () -> solrClient.query(collection, query));
+
+            List<SolrInputDocument> updates = new ArrayList<>();
+            for (SolrDocument doc : response.getResults()) {
+                if (corruptedPids.contains(doc.getFieldValue("pid")) || ignoredDatastreams.contains(doc.getFieldValue("ds"))) {
+                    continue;
+                }
+                SolrInputDocument update = new SolrInputDocument();
+                update.addField("id", doc.getFieldValue("id"));
+                update.addField("orphaned", Map.of("set", true));
+                updates.add(update);
+            }
+            if (!updates.isEmpty()) {
+                withRetries("flag orphaned refs", () -> solrClient.add(collection, updates));
+                marked += updates.size();
+            }
+
+            String next = response.getNextCursorMark();
+            if (next.equals(cursor)) {
+                break;
+            }
+            cursor = next;
+        }
+        withRetries("commit", () -> solrClient.commit(collection));
+        LOGGER.info("Orphaned refs flagged: " + marked);
     }
 
     private Instant lastSuccessfulRun() throws IOException, SolrServerException {
@@ -166,7 +237,7 @@ public class ExternalRefsHarvester {
         try {
             docs = extractRefs(pid, foxml);
         } catch (Exception e) {
-            corrupted.incrementAndGet();
+            corruptedPids.add(pid);
             LOGGER.warning("Skipping corrupted object " + pid + " (" + file + "): " + e);
             return;
         }
@@ -237,11 +308,46 @@ public class ExternalRefsHarvester {
 
     private void send(List<SolrInputDocument> docs) {
         try {
-            solrClient.add(collection, docs);
+            withRetries("send a batch of " + docs.size() + " documents", () -> solrClient.add(collection, docs));
         } catch (Exception e) {
             failed.addAndGet(docs.size());
             solrFailed.set(true);
             LOGGER.log(Level.SEVERE, "Failed to send a batch of " + docs.size() + " documents", e);
         }
+    }
+
+    /**
+     * A waiting thread holds up its reader, which slows the walk down instead of piling up work while Solr is away.
+     */
+    private <T> T withRetries(String action, SolrCall<T> call) throws IOException, SolrServerException {
+        for (int attempt = 0; ; attempt++) {
+            try {
+                return call.run();
+            } catch (IOException | SolrServerException | SolrException e) {
+                if (attempt >= retryDelays.size() || solrFailed.get() || !isTransient(e)) {
+                    throw e;
+                }
+                Duration delay = retryDelays.get(attempt);
+                LOGGER.warning("Failed to " + action + ", retry " + (attempt + 1) + "/" + retryDelays.size() + " in " + delay + ": " + e);
+                try {
+                    Thread.sleep(delay.toMillis());
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Interrupted while waiting to retry", interrupted);
+                }
+            }
+        }
+    }
+
+    /**
+     * A request Solr rejects, such as an invalid document, fails the same way every time.
+     */
+    private static boolean isTransient(Exception e) {
+        return !(e instanceof SolrException) || ((SolrException) e).code() >= 500;
+    }
+
+    @FunctionalInterface
+    private interface SolrCall<T> {
+        T run() throws IOException, SolrServerException;
     }
 }
