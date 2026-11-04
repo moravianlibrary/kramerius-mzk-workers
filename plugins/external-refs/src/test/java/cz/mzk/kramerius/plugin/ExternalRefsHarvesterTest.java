@@ -239,6 +239,87 @@ class ExternalRefsHarvesterTest {
         assertNull(solr.state());
     }
 
+    private void objectIn(String dir, String uuid) throws IOException {
+        Files.writeString(Files.createDirectories(store.resolve(dir)).resolve("info%3Afedora%2Fuuid%3A" + uuid), FOXML);
+    }
+
+    @Test
+    void pathsLimitTheRunToMatchingPrefixes() throws Exception {
+        objectIn("00/11/22", "a");
+        objectIn("01/11/22", "b");
+        objectIn("00/21/22", "c");
+        objectIn("10/11/22", "d");
+
+        harvester().harvest(store, 2, false, null, List.of("00/1", "01/"));
+
+        assertEquals(Set.of("uuid:a", "uuid:b"), Set.copyOf(solr.pids()));
+    }
+
+    @Test
+    void pathPrefixCanEndInsideADirectoryName() throws Exception {
+        objectIn("00/11/22", "a");
+        objectIn("0f/11/22", "b");
+        objectIn("10/11/22", "c");
+
+        harvester().harvest(store, 2, false, null, List.of("0"));
+
+        assertEquals(Set.of("uuid:a", "uuid:b"), Set.copyOf(solr.pids()));
+    }
+
+    @Test
+    void pathRunKeepsStateAndFlagsNothing() throws Exception {
+        objectIn("00/11/22", "a");
+        solr.staleRefs.add(staleRef("uuid:gone", "IMG_FULL"));
+
+        harvester().harvest(store, 2, true, null, List.of("00"));
+
+        assertNull(solr.state());
+        assertEquals(List.of(), solr.orphaned());
+        assertTrue(solr.committed);
+    }
+
+    @Test
+    void pathRunStillReadsOnlyWhatChangedSinceLastSuccessfulRun() throws Exception {
+        object("old", FOXML);
+        Files.setLastModifiedTime(store.resolve("00/11/info%3Afedora%2Fuuid%3Aold"), FileTime.from(Instant.now().minus(Duration.ofDays(30))));
+        object("new", FOXML);
+        solr.existingState = Date.from(Instant.now().minus(Duration.ofDays(1)));
+
+        harvester().harvest(store, 2, false, null, List.of("00"));
+
+        assertEquals(List.of("uuid:new"), solr.pids());
+    }
+
+    @Test
+    void unknownPathFailsBeforeTheWalk() throws Exception {
+        object("a", FOXML);
+
+        assertThrows(IllegalArgumentException.class, () -> harvester().harvest(store, 2, false, null, List.of("00", "zz")));
+
+        assertTrue(solr.documents.isEmpty());
+    }
+
+    @Test
+    void sinceOverridesLastSuccessfulRunAndSavesStateWithoutFlagging() throws Exception {
+        object("old", FOXML);
+        Files.setLastModifiedTime(store.resolve("00/11/info%3Afedora%2Fuuid%3Aold"), FileTime.from(Instant.now().minus(Duration.ofDays(30))));
+        object("new", FOXML);
+        solr.staleRefs.add(staleRef("uuid:gone", "IMG_FULL"));
+
+        harvester().harvest(store, 2, false, Instant.now().minus(Duration.ofDays(1)), List.of());
+
+        assertEquals(List.of("uuid:new"), solr.pids());
+        assertNotNull(solr.state());
+        assertEquals(List.of(), solr.orphaned());
+    }
+
+    @Test
+    void parsesPathPrefixes() {
+        assertEquals(List.of(), ExternalRefsStarter.parsePaths(null));
+        assertEquals(List.of("00/", "0a"), ExternalRefsStarter.parsePaths(" /00/ , 0a,"));
+        assertThrows(IllegalArgumentException.class, () -> ExternalRefsStarter.parsePaths(" , "));
+    }
+
     @Test
     void shortSolrOutageIsRetriedAndRunCompletes() throws Exception {
         object("a", FOXML);

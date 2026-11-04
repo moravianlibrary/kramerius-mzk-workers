@@ -13,7 +13,9 @@ import org.ceskaexpedice.processplatform.worker.config.WorkerConfiguration;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.time.Instant;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -27,8 +29,16 @@ public class ExternalRefsStarter {
             // String, because the worker cannot instantiate an omitted Integer parameter
             @ParameterName("threads") String threads,
             @ParameterName("ignoreDs") String ignoreDs,
-            @ParameterName("full") Boolean full
+            @ParameterName("full") Boolean full,
+            @ParameterName("paths") String paths,
+            @ParameterName("since") String since
     ) throws IOException, SolrServerException, InterruptedException {
+        if (Boolean.TRUE.equals(full) && since != null) {
+            throw new IllegalArgumentException("Parameters 'full' and 'since' cannot be combined");
+        }
+        Instant modifiedSince = since != null ? Instant.parse(since.trim()) : null;
+        List<String> pathPrefixes = parsePaths(paths);
+
         String solrHost = KConfiguration.getInstance().getConfiguration().getString(CONFIG_SOLR_HOST);
         if (solrHost == null) {
             throw new IllegalStateException("Missing configuration key '" + CONFIG_SOLR_HOST + "'");
@@ -53,11 +63,29 @@ public class ExternalRefsStarter {
         long corrupted;
         try (HttpSolrClient solrClient = new HttpSolrClient.Builder(solrBaseUrl).build()) {
             corrupted = new ExternalRefsHarvester(solrClient, collection, ignored)
-                    .harvest(objectStoreRoot, readers, Boolean.TRUE.equals(full));
+                    .harvest(objectStoreRoot, readers, Boolean.TRUE.equals(full), modifiedSince, pathPrefixes);
         }
         if (corrupted > 0) {
             finishWithWarning();
         }
+    }
+
+    /**
+     * A blank value is rejected, because treating it as no limit would start a run over the whole store.
+     */
+    static List<String> parsePaths(String paths) {
+        if (paths == null) {
+            return List.of();
+        }
+        List<String> prefixes = Arrays.stream(paths.split(","))
+                .map(String::trim)
+                .map(path -> path.replaceFirst("^/+", ""))
+                .filter(path -> !path.isEmpty())
+                .toList();
+        if (prefixes.isEmpty()) {
+            throw new IllegalArgumentException("Parameter 'paths' has no path prefix: '" + paths + "'");
+        }
+        return prefixes;
     }
 
     /**

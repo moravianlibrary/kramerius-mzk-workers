@@ -42,6 +42,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import java.util.stream.Stream;
 
 /**
  * Harvests the latest contentLocation of externally managed datastreams from FOXML files into Solr.
@@ -55,6 +56,10 @@ import java.util.logging.Logger;
  * <p>A successful scan of the whole store rewrites every ref it finds, so a ref older than the scan no longer
  * exists in the store and is flagged as orphaned. A ref that comes back is rewritten, which resets the flag
  * to its schema default. Incremental runs cannot tell and do not flag anything.</p>
+ *
+ * <p>A run limited to some paths covers only a part of the store, so it does not move the last successful run
+ * forward and does not flag anything. Once all parts are done, a whole store run with an explicit start time
+ * picks up what changed in the meantime and records the state.</p>
  *
  * <p>Solr calls made during a run are retried, because one timeout must not cost a scan that takes days.
  * Every one of them is idempotent: adds overwrite the same ids, and flagging sets the same value.</p>
@@ -100,15 +105,35 @@ public class ExternalRefsHarvester {
      * @return the number of skipped corrupted objects
      */
     public long harvest(Path storeRoot, int threads, boolean full) throws IOException, SolrServerException, InterruptedException {
+        return harvest(storeRoot, threads, full, null, List.of());
+    }
+
+    /**
+     * @param modifiedSince overrides the last successful run, null to use it
+     * @param paths path prefixes relative to the store root to limit the run to, empty for the whole store
+     * @return the number of skipped corrupted objects
+     */
+    public long harvest(Path storeRoot, int threads, boolean full, Instant modifiedSince, List<String> paths)
+            throws IOException, SolrServerException, InterruptedException {
+        requireExistingPaths(storeRoot, paths);
+
         Instant runStart = Instant.now();
-        Instant since = full ? Instant.EPOCH : lastSuccessfulRun();
-        LOGGER.info("Harvesting " + storeRoot + " modified since " + since + " with " + threads + " threads");
+        Instant since;
+        if (full) {
+            since = Instant.EPOCH;
+        } else if (modifiedSince != null) {
+            since = modifiedSince.minus(SINCE_OVERLAP);
+        } else {
+            since = lastSuccessfulRun();
+        }
+        boolean wholeStore = paths.isEmpty();
+        LOGGER.info("Harvesting " + (wholeStore ? storeRoot : storeRoot + " " + paths) + " modified since " + since + " with " + threads + " threads");
 
         // When the queue is full, the walking thread reads the file itself, which keeps memory usage bounded
         ThreadPoolExecutor readers = new ThreadPoolExecutor(threads, threads, 0, TimeUnit.MILLISECONDS,
                 new ArrayBlockingQueue<>(MAX_QUEUED_TASKS), new ThreadPoolExecutor.CallerRunsPolicy());
         try {
-            walk(storeRoot, since, readers);
+            walk(storeRoot, since, paths, readers);
         } finally {
             readers.shutdown();
             readers.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);
@@ -119,15 +144,17 @@ public class ExternalRefsHarvester {
             throw new IOException("Harvest failed: " + failed.get() + " failures after " + processed.get() + " processed objects");
         }
 
-        SolrInputDocument state = new SolrInputDocument();
-        state.addField("id", STATE_DOC_ID);
-        state.addField("timestamp", Date.from(runStart));
-        withRetries("save the harvest state", () -> solrClient.add(collection, state));
+        if (wholeStore) {
+            SolrInputDocument state = new SolrInputDocument();
+            state.addField("id", STATE_DOC_ID);
+            state.addField("timestamp", Date.from(runStart));
+            withRetries("save the harvest state", () -> solrClient.add(collection, state));
+        }
         withRetries("commit", () -> solrClient.commit(collection));
         LOGGER.info("Harvest finished, processed objects: " + processed.get() + ", skipped corrupted objects: " + corruptedPids.size());
 
         // After saving the state: failing here must not cost another scan of the whole store
-        if (since.equals(Instant.EPOCH)) {
+        if (wholeStore && since.equals(Instant.EPOCH)) {
             markOrphaned(runStart.minus(SINCE_OVERLAP));
         }
         return corruptedPids.size();
@@ -183,11 +210,41 @@ public class ExternalRefsHarvester {
         return ((Date) state.getFieldValue("timestamp")).toInstant().minus(SINCE_OVERLAP);
     }
 
-    private void walk(Path storeRoot, Instant since, ThreadPoolExecutor readers) throws IOException {
+    /**
+     * A prefix that matches nothing would otherwise end as a successful run that did no work.
+     */
+    private static void requireExistingPaths(Path storeRoot, List<String> paths) throws IOException {
+        if (paths.isEmpty()) {
+            return;
+        }
+        List<String> topLevel;
+        try (Stream<Path> children = Files.list(storeRoot)) {
+            topLevel = children.map(child -> child.getFileName().toString()).toList();
+        }
+        for (String path : paths) {
+            if (topLevel.stream().noneMatch(name -> dirMayContainPaths(name, List.of(path)))) {
+                throw new IllegalArgumentException("Path prefix '" + path + "' matches nothing in " + storeRoot);
+            }
+        }
+    }
+
+    /**
+     * @param dir directory relative to the store root
+     */
+    static boolean dirMayContainPaths(String dir, List<String> paths) {
+        String withSlash = dir + "/";
+        return paths.isEmpty() || paths.stream().anyMatch(path -> withSlash.startsWith(path) || path.startsWith(withSlash));
+    }
+
+    private void walk(Path storeRoot, Instant since, List<String> paths, ThreadPoolExecutor readers) throws IOException {
         Files.walkFileTree(storeRoot, new SimpleFileVisitor<>() {
             @Override
             public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) throws IOException {
-                return Files.isHidden(dir) ? FileVisitResult.SKIP_SUBTREE : FileVisitResult.CONTINUE;
+                if (Files.isHidden(dir)) {
+                    return FileVisitResult.SKIP_SUBTREE;
+                }
+                return dir.equals(storeRoot) || dirMayContainPaths(storeRoot.relativize(dir).toString(), paths)
+                        ? FileVisitResult.CONTINUE : FileVisitResult.SKIP_SUBTREE;
             }
 
             @Override
@@ -197,7 +254,9 @@ public class ExternalRefsHarvester {
                     return FileVisitResult.TERMINATE;
                 }
                 String pid = pidFromFileName(file.getFileName().toString());
-                if (pid != null && !attrs.lastModifiedTime().toInstant().isBefore(since)) {
+                String relative = storeRoot.relativize(file).toString();
+                boolean selected = paths.isEmpty() || paths.stream().anyMatch(relative::startsWith);
+                if (pid != null && selected && !attrs.lastModifiedTime().toInstant().isBefore(since)) {
                     readers.execute(() -> processObject(pid, file));
                 }
                 return FileVisitResult.CONTINUE;
