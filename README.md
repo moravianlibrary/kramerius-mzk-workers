@@ -14,6 +14,15 @@ make push IMAGE=<registry>/<group>/kramerius-mzk-worker
 
 Log in to the registry first with `docker login`. Use `BASE_IMAGE=...` to build on another upstream version and `TAG=...` to override the image tag.
 
+By default the image gets every plugin under `plugins/`. To build and ship only some of them, list their directory names in `PLUGINS`, and give such an image its own name so it cannot be mistaken for the full one:
+
+```
+make build PLUGINS=ndk-import IMAGE=kramerius-mzk-worker-ndk
+make push PLUGINS=external-refs,ndk-import IMAGE=<registry>/<group>/kramerius-mzk-worker
+```
+
+Only the listed plugins are compiled and tested. An unknown name fails the build and lists the available plugins.
+
 ## Plugins
 
 ### external-refs
