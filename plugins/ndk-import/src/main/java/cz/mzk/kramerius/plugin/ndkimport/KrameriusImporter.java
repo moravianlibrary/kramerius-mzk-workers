@@ -25,7 +25,10 @@ public final class KrameriusImporter implements ImportRun.Importer {
                     options.indexationType());
         } catch (SolrServerException exception) {
             throw new IOException("Kramerius import failed for " + directory, exception);
+        } finally {
+            // importMain names the process after the work directory when it starts; a failed run
+            // must still show the batch, so the name is restored however importMain ends.
+            PluginContextHolder.getContext().updateProcessName("NDK import " + batchName);
         }
-        PluginContextHolder.getContext().updateProcessName("NDK import " + batchName);
     }
 }
