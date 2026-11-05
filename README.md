@@ -23,6 +23,12 @@ make push PLUGINS=external-refs,ndk-import IMAGE=<registry>/<group>/kramerius-mz
 
 Only the listed plugins are compiled and tested. An unknown name fails the build and lists the available plugins.
 
+## Base image updates
+
+The `base-image` workflow checks Docker Hub daily for a newer `ceskaexpedice/curator-worker` release. It builds and tests the plugins against it, then opens a PR bumping `BASE_IMAGE` when they pass, or an issue with the build log when they don't. Unit tests do not cover runtime behaviour, so read the Kramerius diff linked in the PR before merging. The workflow never pushes an image: publish with `make push` after merging.
+
+It needs *Settings → Actions → General → Allow GitHub Actions to create and approve pull requests*. PRs it opens do not trigger the `check` workflow (GitHub does not chain workflows on the built-in token); the bump run has already tested them.
+
 ## Plugins
 
 ### external-refs
