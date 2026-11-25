@@ -1,4 +1,4 @@
-BASE_IMAGE ?= ceskaexpedice/curator-worker:7.2.2.5
+BASE_IMAGE ?= ceskaexpedice/curator-worker:7.2.3
 IMAGE      ?= kramerius-mzk-worker
 # Comma-separated plugins to build into the image, e.g. PLUGINS=ndk-import; empty means all
 PLUGINS    ?=
