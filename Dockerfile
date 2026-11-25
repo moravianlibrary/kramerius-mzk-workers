@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=ceskaexpedice/curator-worker:7.2.2.5
+ARG BASE_IMAGE=ceskaexpedice/curator-worker:7.2.3
 
 FROM ${BASE_IMAGE} AS base
 
